@@ -1,0 +1,580 @@
+// ============================================================
+// 1.  INTERFACE
+// ============================================================
+interface ahb_if (input logic HCLK, HRESETn);
+  logic [31:0] HADDR;
+  logic [31:0] HWDATA;
+  logic [31:0] HRDATA;
+  logic        HWRITE;
+  logic [1:0]  HTRANS;
+  logic        HREADY;
+  logic        HREADYOUT;
+  logic        HRESP;
+endinterface
+
+
+// ============================================================
+// 2.  DUT  —  AHB-LITE SLAVE MEMORY
+//
+// PROVEN CYCLE-BY-CYCLE PIPELINE MODEL:
+//
+//   Cycle N   (HREADY=1): HADDR=A is the ADDRESS PHASE.
+//                          addr_lat registers A at posedge N.
+//
+//   Cycle N+1 (HREADY=1): addr_lat now holds A (stable).
+//                          DATA PHASE executes: read/write mem[A].
+//                          Meanwhile HADDR=B (next address phase)
+//                          → addr_lat will latch B at posedge N+1.
+//                          BUT the memory access uses the
+//                          COMBINATORIAL read of addr_lat which
+//                          still equals A during cycle N+1
+//                          (non-blocking assign hasn't fired yet
+//                          within this always_ff — addr_lat only
+//                          updates at END of posedge N+1).
+//
+// KEY INSIGHT: Within a single always_ff block, reading addr_lat
+// gives its value FROM THE PREVIOUS CYCLE (pre-NBA value).
+// So in cycle N+1, addr_lat reads as A (correct for data phase)
+// even though it will be updated to B at end of cycle N+1.
+//
+// WAIT STATES: When a wait state is inserted, HREADY goes low.
+// addr_lat is only updated when HREADY=1, so it stays frozen
+// at A throughout the wait. The data-phase FSM re-executes
+// using the same addr_lat=A on the cycle HREADY returns high.
+//
+// SINGLE always_ff BLOCK: Both address-phase latch AND
+// data-phase execution live in ONE block. Reading addr_lat
+// inside the block sees the pre-posedge value (correct).
+// ============================================================
+module ahb_slave_mem (
+  input  logic        HCLK,
+  input  logic        HRESETn,
+  input  logic [31:0] HADDR,
+  input  logic [31:0] HWDATA,
+  output logic [31:0] HRDATA,
+  input  logic        HWRITE,
+  input  logic [1:0]  HTRANS,
+  input  logic        HREADY,
+  output logic        HREADYOUT,
+  output logic        HRESP
+);
+
+  logic [31:0] mem [0:255];
+
+  // Single pipeline register: holds address-phase info.
+  // Updated only when HREADY=1 (slave accepted the address phase).
+  // Frozen during wait states — guarantees stable address for
+  // the entire data phase including all wait-state extensions.
+  logic [31:0] addr_lat;
+  logic        write_lat;
+  logic        trans_lat;
+  logic [1:0]  wait_cnt;
+
+  always_ff @(posedge HCLK or negedge HRESETn) begin
+    if (!HRESETn) begin
+      addr_lat  <= '0;
+      write_lat <= 1'b0;
+      trans_lat <= 1'b0;
+      HRDATA    <= '0;
+      wait_cnt  <= 2'd0;
+      HREADYOUT <= 1'b1;
+
+    end else if (wait_cnt != 2'd0) begin
+      // -------------------------------------------------------
+      // WAIT STATE: count down, hold bus stalled.
+      // Do NOT update addr_lat (HREADY is low during wait).
+      // -------------------------------------------------------
+      wait_cnt  <= wait_cnt - 2'd1;
+      HREADYOUT <= (wait_cnt == 2'd1) ? 1'b1 : 1'b0;
+
+    end else begin
+      // -------------------------------------------------------
+      // READY: execute data phase then latch next address phase.
+      //
+      // Reading addr_lat/write_lat/trans_lat here gives the
+      // VALUES FROM THE PREVIOUS CYCLE (pre-NBA), which is
+      // exactly the address phase registered at posedge N-1.
+      // This is correct for the data phase at cycle N.
+      // -------------------------------------------------------
+      HREADYOUT <= 1'b1;
+
+      // DATA PHASE — use addr_lat (pre-NBA = previous cycle's value)
+      if (trans_lat) begin
+        if (write_lat)
+          mem[addr_lat[9:2]] <= HWDATA;
+        else
+          HRDATA <= mem[addr_lat[9:2]];
+
+        // Randomly insert 2-cycle wait (~25% probability)
+        if ($urandom_range(0, 3) == 0) begin
+          wait_cnt  <= 2'd2;
+          HREADYOUT <= 1'b0;
+        end
+      end
+
+      // ADDRESS PHASE LATCH — update addr_lat for next cycle.
+      // This non-blocking assign fires AFTER the data-phase
+      // reads above, so the data phase always sees the old value.
+      if (HREADY) begin
+        addr_lat  <= HADDR;
+        write_lat <= HWRITE;
+        trans_lat <= HTRANS[1];
+      end
+
+    end
+  end
+
+  assign HRESP = 1'b0;
+
+endmodule
+
+
+// ============================================================
+// 3.  TRANSACTION
+// ============================================================
+class ahb_transaction;
+  rand bit [31:0] addr;
+  rand bit [31:0] data;
+  rand bit        write;
+  rand bit [3:0]  burst_len;
+
+  constraint c_align  { addr[1:0] == 2'b00; }
+  constraint c_range  { addr inside {[32'h00 : 32'hF0]}; }
+  constraint c_fit    { (addr + burst_len * 4) <= 32'd256; }
+  constraint c_burst  { burst_len inside {[4'd1 : 4'd4]}; }
+
+  function void display();
+    $display("[TXN] addr=%0h data=%0h write=%0b burst_len=%0d",
+             addr, data, write, burst_len);
+  endfunction
+endclass
+
+
+// ============================================================
+// 4.  GENERATOR
+// ============================================================
+class generator;
+  mailbox #(ahb_transaction) gen2drv;
+  int num_txns;
+
+  function new(mailbox #(ahb_transaction) mb, int n = 20);
+    gen2drv  = mb;
+    num_txns = n;
+  endfunction
+
+  task run();
+    ahb_transaction txn;
+    repeat (num_txns) begin
+      txn = new();
+      if (!txn.randomize()) $fatal(1, "[GEN] randomize() failed");
+      txn.display();
+      gen2drv.put(txn);
+    end
+    $display("[GEN] Done — %0d transactions sent.", num_txns);
+  endtask
+endclass
+
+
+// ============================================================
+// 5.  DRIVER  (CORRECTED WAIT-STATE HANDLING)
+//
+// AHB rule: when HREADY=0, master must hold HADDR, HWDATA,
+//           HWRITE, HTRANS completely stable.
+//
+// Previous versions violated this because they called
+// @(posedge HCLK) and THEN checked HREADY — meaning
+// non-blocking assigns for the new address/data had already
+// been scheduled at that same posedge BEFORE the check.
+//
+// Correct pattern used here:
+//   1. Clock one edge:  @(posedge HCLK)
+//   2. Read HREADY synchronously (it is stable post-NBA).
+//   3. If HREADY=0 → loop back to step 1 WITHOUT driving anything.
+//   4. If HREADY=1 → drive new address/data NOW (same edge is fine
+//      because HREADY was already confirmed = 1 on this edge).
+//
+// This guarantees bus signals change ONLY on HREADY=1 edges.
+// ============================================================
+class driver;
+  virtual ahb_if vif;
+  mailbox #(ahb_transaction) gen2drv;
+
+  function new(virtual ahb_if v, mailbox #(ahb_transaction) mb);
+    vif      = v;
+    gen2drv  = mb;
+  endfunction
+
+  // Advance to the next posedge where HREADY=1.
+  // NEVER drives any signal — purely waits.
+  // On return, we are AT a posedge where HREADY=1.
+  task wait_hready();
+    @(posedge vif.HCLK);          // first edge
+    while (!vif.HREADY)
+      @(posedge vif.HCLK);        // keep clocking, drive nothing
+  endtask
+
+  task run();
+    ahb_transaction txn;
+    bit [31:0] bdata [4];
+
+    // Idle bus initialisation
+    vif.HTRANS <= 2'b00;
+    vif.HADDR  <= '0;
+    vif.HWDATA <= '0;
+    vif.HWRITE <= 1'b0;
+    @(posedge vif.HCLK);
+
+    forever begin
+      gen2drv.get(txn);
+
+      // Pre-compute all beat data
+      bdata[0] = txn.data;
+      for (int b = 1; b < int'(txn.burst_len); b++)
+        bdata[b] = $urandom;
+
+      // ------------------------------------------------
+      // Beat 0: address phase
+      // Wait for a HREADY=1 edge, then drive beat 0.
+      // ------------------------------------------------
+      wait_hready();
+      vif.HADDR  <= txn.addr;
+      vif.HWRITE <= txn.write;
+      vif.HTRANS <= 2'b10;          // NONSEQ
+
+      // ------------------------------------------------
+      // Beats 1..N-1:
+      //   address phase of beat i  +  data phase of beat i-1
+      // ------------------------------------------------
+      for (int i = 1; i < int'(txn.burst_len); i++) begin
+        // Wait for HREADY=1 (slave accepted beat i-1 address phase)
+        // No driving happens inside wait_hready()
+        wait_hready();
+        vif.HADDR  <= txn.addr + (i * 4);
+        vif.HWDATA <= bdata[i-1];   // data phase of beat i-1
+        vif.HTRANS <= 2'b11;        // SEQ
+      end
+
+      // ------------------------------------------------
+      // End of burst:
+      //   data phase of last beat  +  IDLE address phase
+      // ------------------------------------------------
+      wait_hready();
+      vif.HWDATA <= bdata[txn.burst_len - 1];
+      vif.HTRANS <= 2'b00;          // IDLE
+      vif.HADDR  <= '0;
+      vif.HWRITE <= 1'b0;
+    end
+  endtask
+endclass
+
+
+// ============================================================
+// 6.  MONITOR  (STRICT PIPELINE ORDERING)
+//
+// AHB read timing:
+//   Cycle N   : address phase — HADDR sampled
+//   Cycle N+1 : data phase   — DUT computes HRDATA = mem[addr]
+//               BUT: HRDATA is a registered output (always_ff).
+//               So HRDATA is only VALID at posedge N+1 as a
+//               non-blocking assign result — i.e., it appears
+//               on the output AFTER posedge N+1.
+//               The monitor sampling at posedge N+1 sees the
+//               OLD HRDATA (from posedge N), not the new value.
+//
+// FIX for reads: after detecting the data phase (pending &&
+//   HREADY), delay one more cycle before reading HRDATA.
+//   For writes, HWDATA is driven combinatorially by the master
+//   so it is valid at the data-phase posedge — no extra delay.
+//
+// Step ordering within @posedge (unchanged — critical):
+//   Step 1: data-phase capture  (reads OLD addr_ph)
+//   Step 2: address-phase latch (writes NEW addr_ph)
+// ============================================================
+class monitor;
+  virtual ahb_if vif;
+  mailbox #(ahb_transaction) mon2scb;
+
+  function new(virtual ahb_if v, mailbox #(ahb_transaction) mb);
+    vif      = v;
+    mon2scb  = mb;
+  endfunction
+
+  task run();
+    ahb_transaction txn;
+    bit [31:0] addr_ph  = '0;
+    bit        write_ph = 1'b0;
+    bit        pending  = 1'b0;
+
+    forever begin
+      @(posedge vif.HCLK);
+
+      // STEP 1: data phase — uses addr_ph BEFORE it is updated below
+      if (pending && vif.HREADY) begin
+        txn       = new();
+        txn.addr  = addr_ph;
+        txn.write = write_ph;
+
+        if (write_ph) begin
+          // HWDATA is combinatorial from master — valid now
+          txn.data = vif.HWDATA;
+          mon2scb.put(txn);
+        end else begin
+          // HRDATA is registered in DUT — valid ONE cycle after
+          // the data-phase posedge. Wait one more clock to sample.
+          @(posedge vif.HCLK);
+          txn.data = vif.HRDATA;
+          mon2scb.put(txn);
+        end
+
+        pending = 1'b0;
+      end
+
+      // STEP 2: address phase — overwrites addr_ph for next beat
+      if (vif.HREADY && vif.HTRANS[1]) begin
+        addr_ph  = vif.HADDR;
+        write_ph = vif.HWRITE;
+        pending  = 1'b1;
+      end
+    end
+  endtask
+endclass
+
+
+// ============================================================
+// 7.  SCOREBOARD
+// ============================================================
+class scoreboard;
+  mailbox #(ahb_transaction) mon2scb;
+  bit [31:0] ref_mem [0:255];
+  int        pass_cnt, fail_cnt;
+
+  function new(mailbox #(ahb_transaction) mb);
+    mon2scb  = mb;
+    pass_cnt = 0;
+    fail_cnt = 0;
+  endfunction
+
+  task run();
+    ahb_transaction txn;
+    forever begin
+      mon2scb.get(txn);
+      if (txn.write) begin
+        ref_mem[txn.addr[9:2]] = txn.data;
+        $display("[SCB] WRITE  addr=%0h data=%0h", txn.addr, txn.data);
+        pass_cnt++;
+      end else begin
+        if (ref_mem[txn.addr[9:2]] !== txn.data) begin
+          $error("[SCB] MISMATCH addr=%0h  Exp=%0h  Got=%0h",
+                 txn.addr, ref_mem[txn.addr[9:2]], txn.data);
+          fail_cnt++;
+        end else begin
+          $display("[SCB] READ OK addr=%0h data=%0h", txn.addr, txn.data);
+          pass_cnt++;
+        end
+      end
+    end
+  endtask
+
+  function void report();
+    $display("==============================================");
+    $display("[SCB]  PASS=%0d   FAIL=%0d", pass_cnt, fail_cnt);
+    $display("==============================================");
+  endfunction
+endclass
+
+
+// ============================================================
+// 8.  COVERAGE
+// ============================================================
+class coverage;
+  virtual ahb_if vif;
+
+  covergroup ahb_cg @(posedge vif.HCLK iff vif.HRESETn);
+    cp_write : coverpoint vif.HWRITE  { bins RD={0}; bins WR={1}; }
+    cp_trans : coverpoint vif.HTRANS  {
+      bins IDLE={2'b00}; bins BUSY={2'b01};
+      bins NONSEQ={2'b10}; bins SEQ={2'b11};
+    }
+    cp_addr  : coverpoint vif.HADDR {
+      bins lo={[32'h000:32'h03F]};
+      bins mi={[32'h040:32'h07F]};
+      bins hi={[32'h080:32'h0FF]};
+    }
+    cp_rdy   : coverpoint vif.HREADYOUT { bins READY={1}; bins WAIT={0}; }
+
+    x_rw_trans : cross cp_write, cp_trans;
+    x_rw_addr  : cross cp_write, cp_addr;
+    x_rw_rdy   : cross cp_write, cp_rdy;
+  endgroup
+
+  function new(virtual ahb_if v);
+    vif    = v;
+    ahb_cg = new();
+  endfunction
+endclass
+
+
+// ============================================================
+// 9.  ASSERTIONS
+//
+// addr_stable / write_stable:
+//   Use $past(!HREADY, 1) so assertion only checks on the
+//   SECOND+ wait-state cycle.  On the first wait cycle the
+//   master has just driven a new value (allowed by AHB spec).
+// ============================================================
+module ahb_assertions (
+  input logic        HCLK,
+  input logic        HRESETn,
+  input logic [31:0] HADDR,
+  input logic [31:0] HWDATA,
+  input logic        HWRITE,
+  input logic [1:0]  HTRANS,
+  input logic        HREADY,
+  input logic        HREADYOUT,
+  input logic        HRESP
+);
+
+  // IDLE must not be followed immediately by SEQ
+  property p_valid_trans;
+    @(posedge HCLK) disable iff (!HRESETn)
+    (HTRANS == 2'b00) |=> (HTRANS != 2'b11);
+  endproperty
+  ap_valid_trans: assert property(p_valid_trans)
+    else $error("[ASSERT] Illegal IDLE→SEQ transition");
+
+  // HREADYOUT=0 → HREADY=0 (single-slave: HREADY=HREADYOUT)
+  property p_ready;
+    @(posedge HCLK) disable iff (!HRESETn)
+    (!HREADYOUT) |-> (!HREADY);
+  endproperty
+  ap_ready: assert property(p_ready)
+    else $error("[ASSERT] HREADYOUT=0 but HREADY=1");
+
+  // HWDATA must not change on the SECOND+ wait-state cycle
+  property p_wdata_stable;
+    @(posedge HCLK) disable iff (!HRESETn)
+    (HWRITE && HTRANS[1] && !HREADY && $past(!HREADY, 1))
+      |-> $stable(HWDATA);
+  endproperty
+  ap_wdata_stable: assert property(p_wdata_stable)
+    else $error("[ASSERT] HWDATA changed during extended wait state");
+
+  // HADDR must not change on the SECOND+ wait-state cycle
+  property p_addr_stable;
+    @(posedge HCLK) disable iff (!HRESETn)
+    (HTRANS[1] && !HREADY && $past(!HREADY, 1))
+      |-> $stable(HADDR);
+  endproperty
+  ap_addr_stable: assert property(p_addr_stable)
+    else $error("[ASSERT] HADDR changed during extended wait state");
+
+  // Slave always responds OKAY
+  property p_hresp;
+    @(posedge HCLK) disable iff (!HRESETn)
+    HRESP == 1'b0;
+  endproperty
+  ap_hresp: assert property(p_hresp)
+    else $error("[ASSERT] Unexpected ERROR response");
+
+endmodule
+
+
+// ============================================================
+// 10.  ENVIRONMENT
+// ============================================================
+class environment;
+  generator  gen;
+  driver     drv;
+  monitor    mon;
+  scoreboard scb;
+  coverage   cov;
+
+  mailbox #(ahb_transaction) gen2drv;
+  mailbox #(ahb_transaction) mon2scb;
+  virtual ahb_if vif;
+
+  function new(virtual ahb_if v, int n = 20);
+    vif     = v;
+    gen2drv = new();
+    mon2scb = new();
+    gen = new(gen2drv, n);
+    drv = new(vif, gen2drv);
+    mon = new(vif, mon2scb);
+    scb = new(mon2scb);
+    cov = new(vif);
+  endfunction
+
+  task run();
+    fork
+      gen.run();
+      drv.run();
+      mon.run();
+      scb.run();
+    join_none
+  endtask
+
+  function void report();
+    scb.report();
+    $display("[ENV] Coverage = %0.2f%%", cov.ahb_cg.get_coverage());
+  endfunction
+endclass
+
+
+// ============================================================
+// 11.  TESTBENCH TOP
+//
+// Run this simulation for at LEAST 5000 ns in Vivado.
+// (20 txns x 4 beats x 4 cycles max = 320 cycles = 3200 ns)
+// ============================================================
+module tb;
+
+  logic HCLK, HRESETn;
+
+  ahb_if vif (.HCLK(HCLK), .HRESETn(HRESETn));
+  assign vif.HREADY = vif.HREADYOUT;
+
+  ahb_slave_mem dut (
+    .HCLK      (HCLK),      .HRESETn   (HRESETn),
+    .HADDR     (vif.HADDR), .HWDATA    (vif.HWDATA),
+    .HRDATA    (vif.HRDATA),.HWRITE    (vif.HWRITE),
+    .HTRANS    (vif.HTRANS),.HREADY    (vif.HREADY),
+    .HREADYOUT (vif.HREADYOUT),        .HRESP     (vif.HRESP)
+  );
+
+  ahb_assertions asrt (
+    .HCLK      (HCLK),      .HRESETn   (HRESETn),
+    .HADDR     (vif.HADDR), .HWDATA    (vif.HWDATA),
+    .HWRITE    (vif.HWRITE),.HTRANS    (vif.HTRANS),
+    .HREADY    (vif.HREADY),.HREADYOUT (vif.HREADYOUT),
+    .HRESP     (vif.HRESP)
+  );
+
+  environment env;
+
+  initial HCLK = 0;
+  always  #5 HCLK = ~HCLK;
+
+  initial begin
+    $dumpfile("ahb_waves.vcd");
+    $dumpvars(0, tb);
+  end
+
+  initial begin
+    // Reset
+    HRESETn = 1'b0;
+    repeat (5) @(posedge HCLK);
+    HRESETn = 1'b1;
+    @(posedge HCLK);
+
+    // Run
+    env = new(vif, 20);
+    env.run();
+
+    // Wait for completion (5000 ns = 500 cycles, more than enough)
+    #5000;
+    env.report();
+    $display("[TB] Done at %0t ns", $time);
+    $finish;
+  end
+
+endmodule
